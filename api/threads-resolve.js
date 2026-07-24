@@ -16,7 +16,7 @@ const UA =
 function isThreadsUrl(url) {
   try {
     const u = new URL(url);
-    return /(^|\.)threads\.net$/i.test(u.hostname);
+    return /(^|\.)threads\.(net|com)$/i.test(u.hostname);
   } catch {
     return false;
   }
