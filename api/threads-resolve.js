@@ -4,8 +4,15 @@
  * Deploy path: api/threads-resolve.js  →  Vercel auto-exposes it at
  *   https://<your-project>.vercel.app/api/threads-resolve
  *
- * Same extraction logic as the Node/Express version, just wrapped
- * in Vercel's (req, res) handler format instead of an Express app.
+ * FIX (this version): embed-attempt timeout reduced 5000ms → 2500ms and
+ * fallback timeout reduced 7000ms → 6000ms. Previously worst case was
+ * embed(5s) + fallback(7s) = 12s, which exceeds Vercel's free/hobby tier
+ * 10s function timeout — the function was getting killed mid-request,
+ * which the frontend then displayed as a generic "no media found"
+ * message even though the real cause was a platform-side timeout.
+ * Worst case is now ~8.5s, safely under the 10s ceiling. Fallback also
+ * now returns an explicit 504 "resolve_timeout" error instead of letting
+ * an uncaught rejection crash the handler.
  * ------------------------------------------------------------
  */
 
@@ -41,17 +48,24 @@ function buildEmbedUrl(url) {
   }
 }
 
-async function fetchHtml(url) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": UA,
-      Accept: "text/html,application/xhtml+xml",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-    redirect: "follow",
-  });
-  if (!res.ok) throw new Error("fetch_failed_" + res.status);
-  return res.text();
+async function fetchHtml(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error("fetch_failed_" + res.status);
+    return res.text();
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function metaTags(html) {
@@ -106,6 +120,76 @@ function embeddedCarousel(html) {
   }
   return items;
 }
+
+module.exports = async function handler(req, res) {
+  // CORS so the Blogger-hosted frontend can call this cross-origin
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  if (req.method === "OPTIONS") return res.status(200).end();
+
+  const { url, mode } = req.query;
+
+  if (!url || !isThreadsUrl(url)) {
+    return res.status(400).json({ error: "invalid_url", items: [] });
+  }
+
+  try {
+    let html = "";
+    const embedUrl = buildEmbedUrl(url);
+
+    // Attempt 1: the /embed snapshot (server-rendered, most likely to
+    // contain real media instead of a generic placeholder icon).
+    // Kept short (2.5s) on purpose — "try fast, fall back fast".
+    if (embedUrl) {
+      try {
+        html = await fetchHtml(embedUrl, 2500);
+      } catch {
+        html = "";
+      }
+    }
+
+    // Attempt 2: fall back to the normal post/profile page if the embed
+    // page failed to load or didn't contain any usable media.
+    let carousel = html ? embeddedCarousel(html) : [];
+    let meta = html ? metaTags(html) : {};
+    const embedHadMedia = carousel.length > 0 || meta.video || meta.image;
+
+    if (!embedHadMedia) {
+      try {
+        html = await fetchHtml(url, 6000);
+        carousel = embeddedCarousel(html);
+        meta = metaTags(html);
+      } catch (fallbackErr) {
+        // Both attempts failed — return a clear timeout/error instead of
+        // silently sending items: [], which the frontend shows as a
+        // generic "no media found" and masks the real cause.
+        return res.status(504).json({
+          error: "resolve_timeout",
+          detail: String(fallbackErr),
+          items: [],
+        });
+      }
+    }
+
+    if (mode === "profile") {
+      const items = meta.image ? [{ type: "image", url: meta.image, thumb: meta.image }] : [];
+      return res.status(200).json({ items });
+    }
+
+    if (carousel.length > 1) {
+      return res.status(200).json({ items: carousel });
+    }
+
+    const items = [];
+    if (meta.video) items.push({ type: "video", url: meta.video, thumb: meta.image || "" });
+    else if (meta.image) items.push({ type: "image", url: meta.image, thumb: meta.image });
+    else if (carousel.length === 1) items.push(carousel[0]);
+
+    return res.status(200).json({ items });
+  } catch (err) {
+    return res.status(502).json({ error: "resolve_failed", detail: String(err), items: [] });
+  }
+};
 
 module.exports = async function handler(req, res) {
   // CORS so the Blogger-hosted frontend can call this cross-origin
